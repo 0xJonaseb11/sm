@@ -243,8 +243,9 @@ class FomoscanClient:
         r.raise_for_status()
         return r.json()
 
-    async def get_ranking(self, ranking_id: str) -> dict:
-        r = await self._http.get(f"/v3/rankings/{ranking_id}")
+    async def get_ranking(self, ranking_key: str) -> dict:
+        """ranking_key is the 'key' field from list_rankings, e.g. traders_net_flow_7d."""
+        r = await self._http.get(f"/v3/rankings/{ranking_key}")
         r.raise_for_status()
         return r.json()
 
