@@ -1,4 +1,4 @@
-"""fomoscan v3 REST and WebSocket client."""
+"""fomoscan API client - v2 (all plans) and v3 (paid plan scope)."""
 
 import asyncio
 import json
@@ -10,10 +10,11 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from sm.config import cfg
+from sm.clients.rate_limiter import fomoscan_limiter
 
 log = logging.getLogger("sm.fomoscan")
 
-BASE = cfg.fomoscan_rest
+BASE   = cfg.fomoscan_rest
 WS_URL = cfg.fomoscan_ws
 
 
@@ -29,56 +30,58 @@ class FomoscanClient:
         self._http = httpx.AsyncClient(
             base_url=BASE,
             headers=_headers(),
-            timeout=15.0,
+            timeout=20.0,
         )
 
     async def close(self):
         await self._http.aclose()
 
-    # --- v2 identity (available on all plans) ---
+    async def _get(self, path: str, **kwargs) -> dict:
+        await fomoscan_limiter.acquire()
+        r = await self._http.get(path, **kwargs)
+        r.raise_for_status()
+        return r.json()
+
+    async def _post(self, path: str, **kwargs) -> dict:
+        await fomoscan_limiter.acquire()
+        r = await self._http.post(path, **kwargs)
+        r.raise_for_status()
+        return r.json()
+
+    # -------------------------------------------------------------------------
+    # v2 identity  (available on all plans)
+    # -------------------------------------------------------------------------
 
     async def get_user_by_handle(self, handle: str) -> dict:
         """100 CU on hit. returns wallet when plan allows reveals."""
-        r = await self._http.get(f"/v2/user/handle/{handle}")
-        r.raise_for_status()
-        return r.json()
+        return await self._get(f"/v2/user/handle/{handle}")
 
     async def get_user_by_id(self, user_id: str) -> dict:
         """100 CU on hit."""
-        r = await self._http.get(f"/v2/user/id/{user_id}")
-        r.raise_for_status()
-        return r.json()
+        return await self._get(f"/v2/user/id/{user_id}")
 
     async def get_user_by_wallet(self, address: str) -> dict:
         """30,000 CU on hit - costs a reveal."""
-        r = await self._http.get(f"/v2/user/wallet/{address}")
-        r.raise_for_status()
-        return r.json()
+        return await self._get(f"/v2/user/wallet/{address}")
 
     async def get_pnl_by_handle(self, handle: str) -> dict:
         """30,000 CU on a ready answer - costs a reveal."""
-        r = await self._http.get(f"/v2/user/handle/{handle}/pnl")
-        r.raise_for_status()
-        return r.json()
+        return await self._get(f"/v2/user/handle/{handle}/pnl")
 
     async def batch_pnl_handles(self, handles: list[str]) -> dict:
         """30,000 CU per ready entry."""
-        r = await self._http.post(
-            "/v2/user/handles/pnl", json={"handles": handles}
-        )
-        r.raise_for_status()
-        return r.json()
+        return await self._post("/v2/user/handles/pnl", json={"handles": handles})
 
-    # --- v2 thesis / posts ---
+    # -------------------------------------------------------------------------
+    # v2 thesis / posts  (available on all plans)
+    # -------------------------------------------------------------------------
 
     async def get_theses(self, cursor: str | None = None, limit: int = 20) -> dict:
         """200 CU per 20 rows."""
         params: dict = {"limit": limit}
         if cursor:
             params["before"] = cursor
-        r = await self._http.get("/v2/thesis", params=params)
-        r.raise_for_status()
-        return r.json()
+        return await self._get("/v2/thesis", params=params)
 
     async def get_theses_for_token(
         self, token_address: str, cursor: str | None = None, limit: int = 20
@@ -87,11 +90,7 @@ class FomoscanClient:
         params: dict = {"limit": limit}
         if cursor:
             params["before"] = cursor
-        r = await self._http.get(
-            f"/v2/thesis/token/{token_address}", params=params
-        )
-        r.raise_for_status()
-        return r.json()
+        return await self._get(f"/v2/thesis/token/{token_address}", params=params)
 
     async def get_theses_for_user(
         self, user_id: str, cursor: str | None = None, limit: int = 20
@@ -100,119 +99,31 @@ class FomoscanClient:
         params: dict = {"limit": limit}
         if cursor:
             params["before"] = cursor
-        r = await self._http.get(
-            f"/v2/thesis/user/{user_id}", params=params
-        )
-        r.raise_for_status()
-        return r.json()
+        return await self._get(f"/v2/thesis/user/{user_id}", params=params)
 
     async def get_trending_tokens(self) -> dict:
         """10 CU per call."""
-        r = await self._http.get("/v2/leaderboard/tokens/trending")
-        r.raise_for_status()
-        return r.json()
+        return await self._get("/v2/leaderboard/tokens/trending")
 
-    # --- v3 identity (paid plan scope) ---
-
-    async def lookup_trader(
-        self, handle: str, platform: str | None = None
-    ) -> dict:
-        params = {"handle": handle}
-        if platform:
-            params["platform"] = platform
-        r = await self._http.get("/v3/traders/lookup", params=params)
-        r.raise_for_status()
-        return r.json()
-
-    async def get_trader(self, trader_id: str) -> dict:
-        r = await self._http.get(f"/v3/traders/{trader_id}")
-        r.raise_for_status()
-        return r.json()
-
-    async def get_trader_wallets(self, trader_id: str) -> dict:
-        r = await self._http.get(f"/v3/traders/{trader_id}/wallets")
-        r.raise_for_status()
-        return r.json()
-
-    async def get_trader_pnl(
-        self, trader_id: str, window: str = "7d"
-    ) -> dict:
-        r = await self._http.get(
-            f"/v3/traders/{trader_id}/pnl", params={"window": window}
-        )
-        r.raise_for_status()
-        return r.json()
-
-    async def batch_pnl(self, trader_ids: list[str]) -> dict:
-        r = await self._http.post(
-            "/v3/traders/pnl", json={"traderIds": trader_ids}
-        )
-        r.raise_for_status()
-        return r.json()
-
-    async def resolve_wallet(self, family: str, address: str) -> dict:
-        r = await self._http.get(f"/v3/wallets/{family}/{address}")
-        r.raise_for_status()
-        return r.json()
-
-    # --- v3 posts (paid plan scope) ---
-
-    async def get_feed(
-        self,
-        platform: str | None = None,
-        token_id: str | None = None,
-        cursor: str | None = None,
-    ) -> dict:
-        params: dict = {}
-        if platform:
-            params["platform"] = platform
-        if token_id:
-            params["token"] = token_id
-        if cursor:
-            params["cursor"] = cursor
-        r = await self._http.get("/v3/posts", params=params)
-        r.raise_for_status()
-        return r.json()
-
-    async def get_token_posts(
-        self, token_id: str, cursor: str | None = None
-    ) -> dict:
-        params: dict = {"token": token_id}
-        if cursor:
-            params["cursor"] = cursor
-        r = await self._http.get(f"/v3/posts/token/{token_id}", params=params)
-        r.raise_for_status()
-        return r.json()
-
-    async def get_trader_posts(self, trader_id: str) -> dict:
-        r = await self._http.get(f"/v3/posts/trader/{trader_id}")
-        r.raise_for_status()
-        return r.json()
-
-    # --- pump.fun via fomoscan ---
+    # -------------------------------------------------------------------------
+    # v2 pump.fun  (available on all plans, 10 CU per call)
+    # -------------------------------------------------------------------------
 
     async def pump_leaderboard(self) -> dict:
-        r = await self._http.get("/v2/pump/leaderboard/traders")
-        r.raise_for_status()
-        return r.json()
+        return await self._get("/v2/pump/leaderboard/traders")
 
     async def pump_user_by_wallet(self, wallet: str) -> dict:
-        r = await self._http.get(f"/v2/pump/user/wallet/{wallet}")
-        r.raise_for_status()
-        return r.json()
+        return await self._get(f"/v2/pump/user/wallet/{wallet}")
 
     async def pump_pnl(self, wallet: str) -> dict:
-        r = await self._http.get(f"/v2/pump/user/wallet/{wallet}/pnl")
-        r.raise_for_status()
-        return r.json()
+        """500 CU per call."""
+        return await self._get(f"/v2/pump/user/wallet/{wallet}/pnl")
 
     async def pump_callouts(self, cursor: str | None = None) -> dict:
         params = {}
         if cursor:
             params["cursor"] = cursor
-        r = await self._http.get("/v2/pump/thesis", params=params)
-        r.raise_for_status()
-        return r.json()
+        return await self._get("/v2/pump/thesis", params=params)
 
     async def pump_token_callouts(
         self, token_address: str, cursor: str | None = None
@@ -220,84 +131,87 @@ class FomoscanClient:
         params = {}
         if cursor:
             params["cursor"] = cursor
-        r = await self._http.get(
-            f"/v2/pump/thesis/token/{token_address}", params=params
-        )
-        r.raise_for_status()
-        return r.json()
+        return await self._get(f"/v2/pump/thesis/token/{token_address}", params=params)
 
-    # --- leaderboards ---
+    async def pump_wallet_callouts(
+        self, wallet: str, cursor: str | None = None
+    ) -> dict:
+        params = {}
+        if cursor:
+            params["cursor"] = cursor
+        return await self._get(f"/v2/pump/thesis/wallet/{wallet}", params=params)
 
-    async def list_leaderboards(self) -> dict:
-        r = await self._http.get("/v3/leaderboards")
-        r.raise_for_status()
-        return r.json()
+    # -------------------------------------------------------------------------
+    # v3 identity / traders  (paid plan scope - 403 on explore)
+    # -------------------------------------------------------------------------
 
-    async def get_leaderboard(self, board_id: str) -> dict:
-        r = await self._http.get(f"/v3/leaderboards/{board_id}")
-        r.raise_for_status()
-        return r.json()
+    async def lookup_trader(self, handle: str, platform: str | None = None) -> dict:
+        params = {"handle": handle}
+        if platform:
+            params["platform"] = platform
+        return await self._get("/v3/traders/lookup", params=params)
+
+    async def get_trader_wallets(self, trader_id: str) -> dict:
+        return await self._get(f"/v3/traders/{trader_id}/wallets")
+
+    async def get_trader_pnl(self, trader_id: str, window: str = "7d") -> dict:
+        return await self._get(f"/v3/traders/{trader_id}/pnl", params={"window": window})
+
+    async def resolve_wallet(self, family: str, address: str) -> dict:
+        return await self._get(f"/v3/wallets/{family}/{address}")
+
+    # -------------------------------------------------------------------------
+    # v3 rankings / leaderboards  (works on explore)
+    # -------------------------------------------------------------------------
 
     async def list_rankings(self) -> dict:
-        r = await self._http.get("/v3/rankings")
-        r.raise_for_status()
-        return r.json()
+        return await self._get("/v3/rankings")
 
     async def get_ranking(self, ranking_key: str) -> dict:
-        """ranking_key is the 'key' field from list_rankings, e.g. traders_net_flow_7d."""
-        r = await self._http.get(f"/v3/rankings/{ranking_key}")
-        r.raise_for_status()
-        return r.json()
+        """ranking_key is the 'key' field from list_rankings."""
+        return await self._get(f"/v3/rankings/{ranking_key}")
 
-    # --- token lookup ---
+    async def list_leaderboards(self) -> dict:
+        return await self._get("/v3/leaderboards")
 
-    async def get_token(self, token_id: str) -> dict:
-        r = await self._http.get(f"/v3/tokens/{token_id}")
-        r.raise_for_status()
-        return r.json()
+    async def get_leaderboard(self, board_id: str) -> dict:
+        return await self._get(f"/v3/leaderboards/{board_id}")
 
-    # --- account / key info ---
+    # -------------------------------------------------------------------------
+    # v3 trades  (paid plan scope)
+    # -------------------------------------------------------------------------
+
+    async def get_trades(self, cursor: str | None = None) -> dict:
+        params: dict = {}
+        if cursor:
+            params["cursor"] = cursor
+        return await self._get("/v3/trades", params=params)
+
+    async def get_trader_trades(self, trader_id: str, cursor: str | None = None) -> dict:
+        params: dict = {}
+        if cursor:
+            params["cursor"] = cursor
+        return await self._get(f"/v3/traders/{trader_id}/trades", params=params)
+
+    # -------------------------------------------------------------------------
+    # v3 posts  (paid plan scope)
+    # -------------------------------------------------------------------------
+
+    async def get_trader_posts(self, trader_id: str) -> dict:
+        return await self._get(f"/v3/posts/trader/{trader_id}")
+
+    # -------------------------------------------------------------------------
+    # account
+    # -------------------------------------------------------------------------
 
     async def whoami(self) -> dict:
-        r = await self._http.get("/v2/me")
-        r.raise_for_status()
-        return r.json()
-
-    # --- live trades ---
-
-    async def get_trades(
-        self, cursor: str | None = None, trader_id: str | None = None
-    ) -> dict:
-        params: dict = {}
-        if cursor:
-            params["cursor"] = cursor
-        if trader_id:
-            params["traderId"] = trader_id
-        r = await self._http.get("/v3/trades", params=params)
-        r.raise_for_status()
-        return r.json()
-
-    async def get_trader_trades(
-        self, trader_id: str, cursor: str | None = None
-    ) -> dict:
-        params: dict = {}
-        if cursor:
-            params["cursor"] = cursor
-        r = await self._http.get(
-            f"/v3/traders/{trader_id}/trades", params=params
-        )
-        r.raise_for_status()
-        return r.json()
+        return await self._get("/v2/me")
 
 
 class FomoscanStream:
     """
-    websocket stream for live posts from fomoscan v3.
-
-    usage:
-        stream = FomoscanStream()
-        async for frame in stream.listen(platforms=["fomo","pump"]):
-            print(frame)
+    websocket stream for live posts (requires Growth plan or higher).
+    reconnects automatically with exponential backoff and cursor replay.
     """
 
     def __init__(self):
@@ -340,7 +254,7 @@ class FomoscanStream:
                             yield frame
 
                         elif ftype == "error":
-                            log.warning("ws error: %s", frame.get("error"))
+                            log.warning("ws error frame: %s", frame.get("error"))
 
                         elif ftype == "ping":
                             await ws.send(json.dumps({"type": "pong"}))
