@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-scripts/wtc.py  (watch the charts)
+scripts/wtc.py  -  watch the charts
 
-polls a list of traders every N seconds and prints any new theses
-or rank changes. runs until ctrl+c.
+polls a list of fomoscan traders every N seconds.
+shows a live table with their latest theses and alerts on new ones.
+auto-loads the top N from the fomo or pump leaderboard if --board is set.
 
 usage:
-    python scripts/wtc.py the_nutgod cryptolyxe kyle
+    python scripts/wtc.py the_nutgod kyle cryptolyxe
+    python scripts/wtc.py --board fomo              # auto top 10 fomo traders
+    python scripts/wtc.py --board pump              # auto top 10 pump traders
+    python scripts/wtc.py --board fomo --top 20
+    python scripts/wtc.py the_nutgod --interval 60
     python scripts/wtc.py --handles-file handles.txt
-    python scripts/wtc.py --board fomo                # watch fomo #1-10 from live board
-    python scripts/wtc.py --board pump                # watch pump #1-10
-    python scripts/wtc.py the_nutgod --interval 60    # poll every 60s (default 90)
 """
 
 import asyncio
@@ -24,21 +26,22 @@ from rich.live import Live
 from rich.table import Table
 from rich.panel import Panel
 from rich.rule import Rule
-from rich.text import Text
+from rich.console import Group
 from rich import box
 
 sys.path.insert(0, __import__("os").path.dirname(__file__) + "/..")
 
 from sm.clients.fomoscan import FomoscanClient
+from sm.cache import handle_cache, thesis_cache
 from sm.config import cfg
 from sm import fmt
 
 console = Console()
 
-# track last seen thesis id per trader so we only alert on new ones
-_seen_theses: dict[str, set] = {}
-# store trader state for the live table
-_state: dict[str, dict] = {}
+# state per handle
+_state:  dict[str, dict] = {}
+_seen:   dict[str, set]  = {}   # seen thesis ids per handle
+_alerts: list[str]       = []
 
 
 def _decode(a) -> float | None:
@@ -48,71 +51,113 @@ def _decode(a) -> float | None:
         return float(a)
     raw = a.get("value")
     dec = a.get("decimals", 6)
-    if raw is None:
-        return None
-    return float(str(raw)) / (10 ** dec)
+    return float(str(raw)) / (10 ** dec) if raw is not None else None
 
 
-async def load_board_handles(client: FomoscanClient, board: str, top: int = 10) -> list[str]:
-    """pull top N handles from fomo or pump leaderboard."""
+async def load_board_handles(client: FomoscanClient, board: str, top: int) -> list[str]:
     handles = []
-    if board == "fomo":
-        try:
+    try:
+        if board == "fomo":
             rankings = await client.list_rankings()
-            items = rankings.get("items", [])
-            meta = next((r for r in items if r.get("window") == "7d"), items[0] if items else None)
-            if meta:
-                data = await client.get_ranking(meta.get("key", ""))
+            meta     = rankings.get("items", [])
+            item     = next((r for r in meta if r.get("window") == "7d"), meta[0] if meta else None)
+            if item:
+                data = await client.get_ranking(item.get("key", ""))
                 for entry in data.get("entries", [])[:top]:
-                    h = (entry.get("subject", {}).get("canonical", {}).get("display", {}).get("handle") or "")
+                    h = (entry.get("subject", {}).get("canonical", {}).get("display", {}) or {}).get("handle", "")
                     if h:
                         handles.append(h)
-        except Exception as e:
-            console.print(f"[dim]board load error: {e}[/]")
-    elif board == "pump":
-        try:
+        elif board == "pump":
             r = await client.pump_leaderboard()
-            for entry in (r.get("entries", []) or r.get("items", []))[:top]:
+            for entry in (r.get("entries", []) or [])[:top]:
                 h = entry.get("username") or entry.get("handle") or ""
                 if h:
                     handles.append(h)
-        except Exception as e:
-            console.print(f"[dim]pump board error: {e}[/]")
+    except Exception as e:
+        console.print(f"[dim]board load error: {e}[/]")
     return handles
 
 
-async def poll_trader(client: FomoscanClient, handle: str) -> dict:
-    """pull profile + recent theses for one trader. returns state dict."""
-    state = _state.get(handle, {"handle": handle, "thesis_count": 0, "new": []})
-    try:
-        u = await client.get_user_by_handle(handle)
-        uid = u.get("id", "")
-        state["name"]    = u.get("name") or handle
-        state["sol"]     = u.get("solanaAddress") or ""
-        state["twitter"] = u.get("twitter") or ""
-        state["uid"]     = uid
+async def poll_one(client: FomoscanClient, handle: str) -> dict:
+    st = _state.get(handle, {
+        "handle":        handle,
+        "name":          handle,
+        "sol":           "",
+        "twitter":       "",
+        "thesis_count":  0,
+        "new_theses":    [],
+        "last_sym":      "",
+        "last_body":     "",
+        "updated":       0,
+        "error":         "",
+        "first_run":     True,
+    })
 
+    try:
+        # only fetch profile on first run or every 10m
+        if st.get("first_run") or (time.time() - st.get("prof_updated", 0)) > 600:
+            u   = await client.get_user_by_handle(handle)
+            uid = u.get("id", "")
+            st["name"]        = u.get("name", "") or handle
+            st["sol"]         = u.get("solanaAddress", "") or ""
+            st["twitter"]     = u.get("twitter", "") or ""
+            st["uid"]         = uid
+            st["prof_updated"] = time.time()
+
+        uid = st.get("uid", "")
         if uid:
             theses_resp = await client.get_theses_for_user(uid, limit=5)
-            theses = theses_resp if isinstance(theses_resp, list) else theses_resp.get("items", [])
-            seen = _seen_theses.setdefault(handle, set())
-            new = []
+            theses = (
+                theses_resp if isinstance(theses_resp, list)
+                else theses_resp.get("items", []) or []
+            )
+            seen     = _seen.setdefault(handle, set())
+            new_this = []
+
             for t in theses:
-                tid = t.get("id", "")
-                if tid and tid not in seen:
-                    seen.add(tid)
-                    sym  = t.get("tokenSymbol") or "?"
-                    body = (t.get("body") or t.get("text") or "")[:80]
-                    new.append({"sym": sym, "body": body, "ts": time.time()})
-            state["new"] = new
-            state["thesis_count"] = len(theses)
-        state["updated"] = int(time.time())
-        state["error"]   = ""
+                tid  = t.get("id", "")
+                sym  = t.get("tokenSymbol") or (t.get("token", {}) or {}).get("symbol", "") or "?"
+                body = (t.get("body") or t.get("text") or "")[:80]
+                if tid:
+                    if tid not in seen:
+                        seen.add(tid)
+                        if not st.get("first_run"):
+                            new_this.append({"sym": sym, "body": body, "ts": time.time()})
+                    if not st["last_sym"]:
+                        st["last_sym"]  = sym
+                        st["last_body"] = body
+
+            # update last seen thesis
+            if theses:
+                t0 = theses[0]
+                st["last_sym"]  = t0.get("tokenSymbol") or (t0.get("token", {}) or {}).get("symbol", "") or "?"
+                st["last_body"] = (t0.get("body") or t0.get("text") or "")[:60]
+
+            st["thesis_count"] = len(theses)
+            st["new_theses"]   = new_this
+
+            if new_this:
+                now_str = datetime.datetime.now().strftime("%H:%M:%S")
+                for item in new_this:
+                    _alerts.append(
+                        f"[dim]{now_str}[/]  "
+                        f"[bold cyan]{st['name']}[/]  "
+                        f"[yellow]{item['sym']}[/]  "
+                        f"[dim]{item['body'][:70]}[/]"
+                    )
+                while len(_alerts) > 15:
+                    _alerts.pop(0)
+
+        st["first_run"] = False
+        st["error"]     = ""
+        st["updated"]   = int(time.time())
+
     except Exception as e:
-        state["error"] = str(e)[:60]
-        state["updated"] = int(time.time())
-    _state[handle] = state
-    return state
+        st["error"]   = str(e)[:60]
+        st["updated"] = int(time.time())
+
+    _state[handle] = st
+    return st
 
 
 def build_watch_table(handles: list[str]) -> Table:
@@ -121,27 +166,30 @@ def build_watch_table(handles: list[str]) -> Table:
         header_style="bold white",
         expand=True,
         pad_edge=False,
+        show_footer=False,
     )
-    t.add_column("trader",    width=20, no_wrap=True)
-    t.add_column("wallet",    width=14)
-    t.add_column("theses",    width=7,  justify="right", style="dim")
-    t.add_column("updated",   width=10, style="dim")
-    t.add_column("latest",    ratio=1,  no_wrap=True)
+    t.add_column("trader",      width=22, no_wrap=True)
+    t.add_column("wallet",      width=14)
+    t.add_column("theses",      width=7,  justify="right", style="dim")
+    t.add_column("updated",     width=9,  style="dim")
+    t.add_column("latest call", ratio=1,  no_wrap=True)
 
     for handle in handles:
-        st = _state.get(handle, {})
-        name    = st.get("name", handle)
-        sol     = st.get("sol", "")
-        tc      = st.get("thesis_count", "-")
-        updated = st.get("updated", 0)
-        error   = st.get("error", "")
-        new     = st.get("new", [])
+        st     = _state.get(handle, {})
+        name   = st.get("name", handle)
+        sol    = st.get("sol", "")
+        tc     = st.get("thesis_count", "-")
+        upd    = st.get("updated", 0)
+        error  = st.get("error", "")
+        sym    = st.get("last_sym", "")
+        body   = st.get("last_body", "")
+        new    = st.get("new_theses", [])
 
         if error:
             latest = f"[dim red]{error}[/]"
-        elif new:
-            latest_item = new[-1]
-            latest = f"[bold yellow]{latest_item['sym']}[/]  [dim]{latest_item['body'][:60]}[/]"
+        elif sym:
+            highlight = "[bold yellow]" if new else "[yellow]"
+            latest = f"{highlight}{sym}[/]  [dim]{body[:55]}[/]"
         else:
             latest = "[dim]-[/]"
 
@@ -149,65 +197,44 @@ def build_watch_table(handles: list[str]) -> Table:
             f"[bold]{name}[/]",
             fmt.short_addr(sol, 5),
             str(tc),
-            fmt.ts_ago(updated),
+            fmt.ts_ago(upd),
             latest,
         )
     return t
 
 
-async def watch_loop(client: FomoscanClient, handles: list[str], interval: int):
-    """poll all handles in a loop, alert on new theses, refresh table."""
-    console.print(f"[dim]watching {len(handles)} traders, polling every {interval}s[/]")
-    console.print(f"[dim]ctrl+c to stop[/]\n")
+async def watch_loop(client: FomoscanClient, handles: list[str], interval: int) -> None:
+    console.print(
+        f"[dim]watching {len(handles)} traders  |  "
+        f"polling every {interval}s  |  ctrl+c to stop[/]\n"
+    )
 
-    # initial load
-    await asyncio.gather(*[poll_trader(client, h) for h in handles])
+    # initial silent load
+    await asyncio.gather(*[poll_one(client, h) for h in handles])
 
-    alert_lines: list[str] = []
-
-    with Live(console=console, refresh_per_second=1, screen=False) as live:
+    with Live(console=console, refresh_per_second=2, screen=False) as live:
         while True:
-            now = datetime.datetime.now().strftime("%H:%M:%S")
+            await asyncio.gather(*[poll_one(client, h) for h in handles])
 
-            # run all polls in parallel
-            results = await asyncio.gather(
-                *[poll_trader(client, h) for h in handles],
-                return_exceptions=True,
+            now_str    = datetime.datetime.now().strftime("%H:%M:%S")
+            watch_tbl  = build_watch_table(handles)
+            alert_body = "\n".join(_alerts) if _alerts else "[dim]listening for new theses...[/]"
+            alert_panel = Panel(
+                alert_body,
+                title=f"[dim]alerts[/]  [bold]{now_str}[/]",
+                expand=True,
             )
-
-            # collect new thesis alerts
-            for st in results:
-                if isinstance(st, dict) and st.get("new"):
-                    for item in st["new"]:
-                        line = (
-                            f"[dim]{now}[/]  "
-                            f"[bold cyan]{st.get('name', st.get('handle','?'))}[/]  "
-                            f"[yellow]{item['sym']}[/]  "
-                            f"[dim]{item['body'][:70]}[/]"
-                        )
-                        alert_lines.append(line)
-                        # keep last 10 alerts
-                        if len(alert_lines) > 10:
-                            alert_lines.pop(0)
-
-            # rebuild display
-            watch_tbl = build_watch_table(handles)
-            alert_text = "\n".join(alert_lines) if alert_lines else "[dim]no new theses yet[/]"
-            alert_panel = Panel(alert_text, title=f"[dim]alerts[/]  [bold]{now}[/]", expand=True)
-
-            from rich.console import Group
             live.update(Group(watch_tbl, alert_panel))
-
             await asyncio.sleep(interval)
 
 
-async def main(handles: list[str], interval: int, board: str | None, top: int):
+async def main(handles: list[str], interval: int, board: str | None, top: int) -> None:
     if not cfg.has_fomoscan():
         console.print("[red]error:[/] FOMOSCAN_KEY not set")
         return
 
     client = FomoscanClient()
-    now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+    now    = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
     console.print(Rule(f"[bold]wtc - watch the charts[/]  [dim]{now}[/]"))
 
     try:
@@ -218,10 +245,10 @@ async def main(handles: list[str], interval: int, board: str | None, top: int):
                 console.print("[red]no handles loaded from board[/]")
                 return
             handles = board_handles
-            console.print(f"[dim]watching: {', '.join(handles)}[/]")
+            console.print("[dim]watching:[/] " + "  ".join(f"[cyan]{h}[/]" for h in handles))
 
         if not handles:
-            console.print("[red]no traders to watch. pass handles as args or use --board[/]")
+            console.print("[red]no traders specified. pass handles as args or use --board[/]")
             return
 
         await watch_loop(client, handles, interval=interval)
@@ -233,14 +260,14 @@ async def main(handles: list[str], interval: int, board: str | None, top: int):
 
 
 if __name__ == "__main__":
-    p = argparse.ArgumentParser(description="watch traders for new theses")
-    p.add_argument("handles", nargs="*", help="fomoscan handles to watch")
-    p.add_argument("--board",    default=None, help="auto-load top handles: fomo | pump")
-    p.add_argument("--top",      type=int, default=10, help="how many from board (default 10)")
-    p.add_argument("--interval", type=int, default=90,
-                   help="poll interval in seconds (default 90, min 60 to stay in rate limit)")
+    p = argparse.ArgumentParser(description="watch fomoscan traders for new theses")
+    p.add_argument("handles",        nargs="*", help="fomoscan handles to watch")
+    p.add_argument("--board",        default=None, help="auto-load handles: fomo | pump")
+    p.add_argument("--top",          type=int, default=10, help="how many from board (default 10)")
+    p.add_argument("--interval",     type=int, default=90,
+                   help="poll interval in seconds (default 90)")
     p.add_argument("--handles-file", default=None,
-                   help="read one handle per line from this file")
+                   help="file with one handle per line")
     args = p.parse_args()
 
     all_handles = list(args.handles)
@@ -254,7 +281,7 @@ if __name__ == "__main__":
 
     asyncio.run(main(
         handles=all_handles,
-        interval=max(args.interval, 60),
+        interval=max(args.interval, 30),
         board=args.board,
         top=args.top,
     ))
