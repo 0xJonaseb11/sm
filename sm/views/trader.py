@@ -1,152 +1,148 @@
-"""single trader lookup view."""
+"""single trader lookup and wallet resolution."""
 
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
-from rich.columns import Columns
 from rich import box
 
 from sm.clients.fomoscan import FomoscanClient
-from sm.clients.pump import PumpClient
 from sm.config import cfg
 from sm import fmt
 
 console = Console()
 
 
-def _amount_usd(a) -> float | None:
-    if a is None:
-        return None
-    if isinstance(a, dict):
-        raw = a.get("amount") or a.get("usd") or a.get("value")
-        if raw is None:
-            return None
-        raw = float(str(raw))
-        # fomoscan stores amounts as integers in smallest unit (1e6 for usd)
-        if abs(raw) > 1_000_000:
-            return raw / 1_000_000
-        return raw
-    return float(a)
+def _net_usd(window: dict) -> float | None:
+    val = window.get("netUsd") or window.get("net") or window.get("total")
+    return float(val) if val is not None else None
 
 
-async def run_trader(handle: str, platform: str | None = None) -> None:
+async def run_trader(handle: str, platform: str | None = None, pnl: bool = False) -> None:
+    """
+    look up a trader by handle using v2 endpoints (available on all plans).
+    pnl=True fetches realized pnl - costs 30,000 CU (one reveal).
+    """
     if not cfg.has_fomoscan():
         console.print("[red]error:[/] FOMOSCAN_KEY not set")
         return
 
     client = FomoscanClient()
     try:
-        console.print(f"[dim]looking up trader: {handle}...[/]")
-        resp = await client.lookup_trader(handle, platform=platform)
-        items = resp.get("items", [])
+        console.print(f"[dim]looking up: {handle} (100 CU)...[/]")
+        resp = await client.get_user_by_handle(handle)
 
-        if not items:
-            suggestions = resp.get("suggestions", [])
-            console.print(f"[yellow]no match for '{handle}'[/]")
-            if suggestions:
-                sug_handles = [
-                    (s.get("canonical", {}) or {}).get("handle", "?")
-                    for s in suggestions
-                ]
-                console.print(f"[dim]suggestions: {', '.join(sug_handles)}[/]")
-            return
+        user_id  = resp.get("id", "")
+        name     = resp.get("name", "") or handle
+        bio      = resp.get("bio", "") or ""
+        twitter  = resp.get("twitter", "") or ""
+        sol_addr = resp.get("solanaAddress")
+        evm_addr = resp.get("evmAddress")
 
-        trader = items[0]
-        canonical = trader.get("canonical", {}) or {}
-        trader_id = trader.get("id", "")
-
-        name = canonical.get("displayName") or canonical.get("handle", handle)
-        platforms = canonical.get("platforms", [])
-        followers = canonical.get("followerCount")
-
-        # render profile panel
-        lines = [
-            f"[bold white]{name}[/]",
-            f"id: [dim]{trader_id}[/]",
-            f"platforms: {', '.join(fmt.platform_tag(p) for p in platforms) or '-'}",
-        ]
-        if followers is not None:
-            lines.append(f"followers: [cyan]{followers:,}[/]")
-
+        # profile panel
+        lines = [f"[bold white]{name}[/]"]
+        if bio:
+            lines.append(f"[dim]{bio[:120]}[/]")
+        if twitter:
+            lines.append(f"x: [cyan]{twitter}[/]")
+        lines.append(f"id: [dim]{user_id}[/]")
         console.print(Panel("\n".join(lines), title="trader", expand=False))
 
         # wallets
-        try:
-            wallets_resp = await client.get_trader_wallets(trader_id)
-            wallets = wallets_resp.get("items", [])
-            if wallets:
-                wt = Table(box=box.SIMPLE, show_header=True, header_style="bold white")
-                wt.add_column("wallet", width=46)
-                wt.add_column("chain", width=8)
-                wt.add_column("tier", width=12)
-                for w in wallets:
-                    addr = w.get("address", "")
-                    family = w.get("family", "")
-                    owners = w.get("owners", []) or []
-                    tier = owners[0].get("tier", "?") if owners else "?"
-                    wt.add_row(addr, family, fmt.tier_tag(tier))
-                console.print(wt)
-        except Exception as e:
-            console.print(f"[dim]wallets unavailable: {e}[/]")
+        wt = Table(box=box.SIMPLE, show_header=True, header_style="bold white", expand=False)
+        wt.add_column("chain",  width=8)
+        wt.add_column("address", width=46)
+        if sol_addr:
+            wt.add_row("solana", sol_addr)
+        if evm_addr:
+            wt.add_row("evm",    evm_addr)
+        if not sol_addr and not evm_addr:
+            wt.add_row("[dim]-[/]", "[dim]no verified wallet on record[/]")
+        console.print(wt)
 
-        # pnl
-        try:
-            pnl_resp = await client.get_trader_pnl(trader_id, window="30d")
-            status = pnl_resp.get("status", "")
-            if status == "ready":
-                windows = pnl_resp.get("windows", {}) or {}
-                pt = Table(
-                    box=box.SIMPLE, show_header=True, header_style="bold white"
-                )
-                pt.add_column("window", width=8)
-                pt.add_column("realized", width=12, justify="right")
-                pt.add_column("unrealized", width=12, justify="right")
-                pt.add_column("total", width=12, justify="right")
-                for win_key, win_data in windows.items():
-                    r = _amount_usd(win_data.get("realized"))
-                    u = _amount_usd(win_data.get("unrealized"))
-                    total_v = _amount_usd(win_data.get("total"))
-                    if total_v is None and r is not None and u is not None:
-                        total_v = r + u
-                    pt.add_row(
-                        win_key,
-                        f"[{fmt.pnl_color(r)}]{fmt.usd(r)}[/]",
-                        f"[{fmt.pnl_color(u)}]{fmt.usd(u)}[/]",
-                        f"[bold {fmt.pnl_color(total_v)}]{fmt.usd(total_v)}[/]",
-                    )
-                console.print(pt)
-            elif status == "pending":
-                retry = pnl_resp.get("retryAfterSeconds", 30)
-                console.print(
-                    f"[dim]pnl is being computed, retry in {retry}s[/]"
-                )
-            elif status == "no_wallet":
-                console.print("[dim]no verified wallets for pnl[/]")
-            else:
-                console.print(f"[dim]pnl status: {status}[/]")
-        except Exception as e:
-            console.print(f"[dim]pnl unavailable: {e}[/]")
+        # pnl - only if explicitly requested (costs 30,000 CU)
+        if pnl:
+            console.print("[dim]fetching pnl (30,000 CU - counts as a reveal)...[/]")
+            try:
+                p = await client.get_pnl_by_handle(handle)
+                status = p.get("status", "")
+                if status == "ready":
+                    windows = p.get("windows", {}) or {}
+                    followers = p.get("followers")
+                    if followers:
+                        console.print(f"followers: [cyan]{followers:,}[/]")
 
-        # recent posts
-        try:
-            posts_resp = await client.get_trader_posts(trader_id)
-            posts = posts_resp.get("items", [])
-            if posts:
-                console.print("\n[bold]recent posts[/]")
-                for post in posts[:5]:
-                    platform = post.get("platform", "")
-                    body = (post.get("body") or post.get("text") or "")[:120]
-                    token = (post.get("token") or {})
-                    tok_sym = (
-                        token.get("symbol") or token.get("name") or ""
+                    pt = Table(
+                        box=box.SIMPLE, show_header=True,
+                        header_style="bold white", expand=False
                     )
-                    console.print(
-                        f"  {fmt.platform_tag(platform)} "
-                        + (f"[yellow]{tok_sym}[/] " if tok_sym else "")
-                        + f"[dim]{body}[/]"
-                    )
-        except Exception:
-            pass
+                    pt.add_column("window", width=6)
+                    pt.add_column("net pnl", width=12, justify="right")
+                    pt.add_column("return", width=8, justify="right")
+                    pt.add_column("volume", width=12, justify="right")
+                    pt.add_column("trades", width=7, justify="right")
+
+                    for win_key in ("24h", "7d", "30d", "all"):
+                        w = windows.get(win_key, {})
+                        if not w:
+                            continue
+                        net = _net_usd(w)
+                        ret = w.get("returnPct")
+                        vol = w.get("volumeUsd")
+                        trades = w.get("trades")
+                        pt.add_row(
+                            win_key,
+                            f"[bold {fmt.pnl_color(net)}]{fmt.usd(net)}[/]",
+                            f"[{fmt.pnl_color(ret)}]{ret:.1f}%[/]" if ret is not None else "-",
+                            fmt.usd(vol, sign=False) if vol else "-",
+                            str(trades) if trades is not None else "-",
+                        )
+
+                    unrealized = p.get("unrealized", {}) or {}
+                    u_pnl = unrealized.get("unrealizedPnlUsd")
+                    if u_pnl is not None:
+                        pt.add_row(
+                            "open",
+                            f"[{fmt.pnl_color(u_pnl)}]{fmt.usd(u_pnl)}[/]",
+                            "-", "-", "-",
+                        )
+                    console.print(pt)
+
+                elif status in ("pending", "failed"):
+                    retry = p.get("retryAfterSeconds", 30)
+                    console.print(f"[dim]pnl {status}, retry in {retry}s[/]")
+                elif status == "no-wallet":
+                    console.print("[dim]no verified wallet for pnl[/]")
+                else:
+                    console.print(f"[dim]pnl: {status}[/]")
+            except Exception as e:
+                console.print(f"[dim]pnl: {e}[/]")
+        else:
+            console.print(
+                "[dim]tip: add --pnl to fetch realized profit (costs 30,000 CU)[/]"
+            )
+
+        # recent theses/posts (200 CU)
+        if user_id:
+            try:
+                console.print("[dim]fetching theses (200 CU)...[/]")
+                theses = await client.get_theses_for_user(user_id, limit=5)
+                items = theses if isinstance(theses, list) else theses.get("items", []) or []
+                if items:
+                    console.print("\n[bold]recent theses[/]")
+                    for t in items[:5]:
+                        token_sym  = t.get("tokenSymbol") or t.get("token", {}).get("symbol", "")
+                        token_net  = t.get("tokenNetwork", "")
+                        body       = (t.get("body") or t.get("text") or "")[:120]
+                        created    = t.get("createdAt") or t.get("postedAt") or 0
+                        console.print(
+                            f"  [yellow]{token_sym or '?'}[/] "
+                            f"[dim]{token_net}[/]  "
+                            f"[dim]{body}[/]"
+                        )
+                else:
+                    console.print("[dim]no theses found[/]")
+            except Exception as e:
+                console.print(f"[dim]theses unavailable: {e}[/]")
 
     except Exception as e:
         console.print(f"[red]error:[/] {e}")
@@ -155,42 +151,50 @@ async def run_trader(handle: str, platform: str | None = None) -> None:
 
 
 async def run_wallet(address: str) -> None:
+    """
+    resolve a wallet to its owner.
+    costs 30,000 CU on a hit (a reveal). free-plan keys only cover the sample set.
+    """
     if not cfg.has_fomoscan():
         console.print("[red]error:[/] FOMOSCAN_KEY not set")
         return
 
     client = FomoscanClient()
     try:
-        console.print(f"[dim]resolving wallet: {address}...[/]")
-        # detect family
-        family = "evm" if address.startswith("0x") else "solana"
-        resp = await client.resolve_wallet(family, address.lower())
+        console.print(
+            f"[dim]resolving {fmt.short_addr(address)} "
+            f"(30,000 CU on hit)...[/]"
+        )
+        resp = await client.get_user_by_wallet(address)
 
-        owners = resp.get("owners", []) or []
-        wallet_addr = resp.get("address", address)
+        user_id  = resp.get("id", "")
+        name     = resp.get("name", "") or resp.get("handle", "")
+        handle   = resp.get("handle", "")
+        twitter  = resp.get("twitter", "") or ""
+        sol_addr = resp.get("solanaAddress")
+        evm_addr = resp.get("evmAddress")
 
-        if not owners:
-            console.print(f"[yellow]no known owner for wallet {fmt.short_addr(wallet_addr)}[/]")
-            return
-
-        console.print(f"[bold]wallet:[/] {wallet_addr}")
-        console.print(f"[bold]chain:[/] {resp.get('family', family)}")
-
-        for owner in owners:
-            trader = owner.get("trader", {}) or {}
-            canonical = (trader.get("canonical") or {})
-            handle = canonical.get("handle", "") or trader.get("id", "")
-            display = canonical.get("displayName", "") or handle
-            tier = owner.get("tier", "?")
-            platforms = canonical.get("platforms", [])
-            console.print(
-                f"\n  [bold white]{display}[/] "
-                f"({fmt.tier_tag(tier)})\n"
-                f"  handle: [cyan]{handle}[/]\n"
-                f"  platforms: {', '.join(fmt.platform_tag(p) for p in platforms) or '-'}"
-            )
+        console.print(f"\n[bold white]{name}[/]  [dim]{handle}[/]")
+        if twitter:
+            console.print(f"x: [cyan]{twitter}[/]")
+        console.print(f"id: [dim]{user_id}[/]")
+        if sol_addr:
+            console.print(f"solana: [dim]{sol_addr}[/]")
+        if evm_addr:
+            console.print(f"evm:    [dim]{evm_addr}[/]")
 
     except Exception as e:
-        console.print(f"[red]error:[/] {e}")
+        # 403 SAMPLE_SET_ONLY means the wallet is real but outside the free set
+        if "403" in str(e):
+            console.print(
+                f"[yellow]wallet not in free-plan sample set.[/] "
+                f"upgrade to reveal it."
+            )
+        elif "404" in str(e):
+            console.print(
+                f"[dim]no verified owner found for {fmt.short_addr(address)}[/]"
+            )
+        else:
+            console.print(f"[red]error:[/] {e}")
     finally:
         await client.close()

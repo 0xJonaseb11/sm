@@ -23,22 +23,22 @@ async def run_token_wall(token_addr: str) -> None:
     try:
         console.print(f"[dim]fetching callouts for {fmt.short_addr(token_addr)}...[/]")
 
-        # first try fomoscan pump callouts
+        # try v2 theses first (200 CU, works on all plans)
         try:
-            resp = await client.pump_token_callouts(token_addr)
-            entries = resp.get("items", []) or resp.get("data", [])
-            source = "pump.fun callouts"
+            resp = await client.get_theses_for_token(token_addr)
+            raw = resp if isinstance(resp, list) else resp.get("items", []) or resp.get("data", [])
+            entries = raw
+            source = "fomoscan theses"
         except Exception:
             entries = []
             source = ""
 
-        # fallback: v3 posts for this token (need tok_ id)
-        # we can try to look it up
+        # fallback: pump.fun callouts via fomoscan v2
         if not entries:
             try:
-                # attempt tok_ lookup using the address as a token id hint
-                # fomoscan tok_ ids are not raw addresses - skip for now
-                console.print("[dim]no pump callouts found for this token[/]")
+                resp2 = await client.pump_token_callouts(token_addr)
+                entries = resp2.get("items", []) or resp2.get("data", [])
+                source = "pump.fun callouts"
             except Exception:
                 pass
 

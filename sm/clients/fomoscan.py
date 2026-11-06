@@ -35,7 +35,84 @@ class FomoscanClient:
     async def close(self):
         await self._http.aclose()
 
-    # --- identity ---
+    # --- v2 identity (available on all plans) ---
+
+    async def get_user_by_handle(self, handle: str) -> dict:
+        """100 CU on hit. returns wallet when plan allows reveals."""
+        r = await self._http.get(f"/v2/user/handle/{handle}")
+        r.raise_for_status()
+        return r.json()
+
+    async def get_user_by_id(self, user_id: str) -> dict:
+        """100 CU on hit."""
+        r = await self._http.get(f"/v2/user/id/{user_id}")
+        r.raise_for_status()
+        return r.json()
+
+    async def get_user_by_wallet(self, address: str) -> dict:
+        """30,000 CU on hit - costs a reveal."""
+        r = await self._http.get(f"/v2/user/wallet/{address}")
+        r.raise_for_status()
+        return r.json()
+
+    async def get_pnl_by_handle(self, handle: str) -> dict:
+        """30,000 CU on a ready answer - costs a reveal."""
+        r = await self._http.get(f"/v2/user/handle/{handle}/pnl")
+        r.raise_for_status()
+        return r.json()
+
+    async def batch_pnl_handles(self, handles: list[str]) -> dict:
+        """30,000 CU per ready entry."""
+        r = await self._http.post(
+            "/v2/user/handles/pnl", json={"handles": handles}
+        )
+        r.raise_for_status()
+        return r.json()
+
+    # --- v2 thesis / posts ---
+
+    async def get_theses(self, cursor: str | None = None, limit: int = 20) -> dict:
+        """200 CU per 20 rows."""
+        params: dict = {"limit": limit}
+        if cursor:
+            params["before"] = cursor
+        r = await self._http.get("/v2/thesis", params=params)
+        r.raise_for_status()
+        return r.json()
+
+    async def get_theses_for_token(
+        self, token_address: str, cursor: str | None = None, limit: int = 20
+    ) -> dict:
+        """200 CU per 20 rows."""
+        params: dict = {"limit": limit}
+        if cursor:
+            params["before"] = cursor
+        r = await self._http.get(
+            f"/v2/thesis/token/{token_address}", params=params
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def get_theses_for_user(
+        self, user_id: str, cursor: str | None = None, limit: int = 20
+    ) -> dict:
+        """200 CU per 20 rows."""
+        params: dict = {"limit": limit}
+        if cursor:
+            params["before"] = cursor
+        r = await self._http.get(
+            f"/v2/thesis/user/{user_id}", params=params
+        )
+        r.raise_for_status()
+        return r.json()
+
+    async def get_trending_tokens(self) -> dict:
+        """10 CU per call."""
+        r = await self._http.get("/v2/leaderboard/tokens/trending")
+        r.raise_for_status()
+        return r.json()
+
+    # --- v3 identity (paid plan scope) ---
 
     async def lookup_trader(
         self, handle: str, platform: str | None = None
@@ -78,7 +155,7 @@ class FomoscanClient:
         r.raise_for_status()
         return r.json()
 
-    # --- posts and callouts ---
+    # --- v3 posts (paid plan scope) ---
 
     async def get_feed(
         self,

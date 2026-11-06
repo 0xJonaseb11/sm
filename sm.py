@@ -65,10 +65,11 @@ def cmd_board(source, window):
 @cli.command("trader")
 @click.argument("handle")
 @click.option("--platform", "-p", default=None, help="narrow to platform: fomo | pump | x")
-def cmd_trader(handle, platform):
+@click.option("--pnl", is_flag=True, default=False, help="fetch realized pnl (costs 30,000 CU)")
+def cmd_trader(handle, platform, pnl):
     """look up a trader by handle and show their wallets + pnl."""
     from sm.views.trader import run_trader
-    _run(run_trader(handle=handle, platform=platform))
+    _run(run_trader(handle=handle, platform=platform, pnl=pnl))
 
 
 @cli.command("wallet")
