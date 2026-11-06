@@ -67,6 +67,42 @@ CREATE TABLE IF NOT EXISTS kv (
     value       TEXT,
     expires_at  INTEGER DEFAULT 0
 );
+
+CREATE TABLE IF NOT EXISTS positions (
+    id              TEXT PRIMARY KEY,  -- wallet:token:venue
+    wallet          TEXT,
+    token_addr      TEXT,
+    token_sym       TEXT,
+    chain           TEXT DEFAULT 'solana',
+    venue           TEXT DEFAULT 'spot',   -- spot | hyperliquid | dydx
+    side            TEXT,                  -- LONG | SHORT | NEUTRAL
+    size_usd        REAL DEFAULT 0,        -- notional at entry
+    entry_usd       REAL DEFAULT 0,        -- avg entry price * size
+    unrealized_pnl  REAL DEFAULT 0,
+    buy_vol_usd     REAL DEFAULT 0,
+    sell_vol_usd    REAL DEFAULT 0,
+    opened_at       INTEGER DEFAULT 0,
+    updated_at      INTEGER DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_positions_wallet ON positions (wallet);
+CREATE INDEX IF NOT EXISTS idx_positions_token  ON positions (token_addr, venue);
+CREATE INDEX IF NOT EXISTS idx_positions_sym    ON positions (token_sym, venue);
+
+CREATE TABLE IF NOT EXISTS signals (
+    token_addr       TEXT,
+    token_sym        TEXT,
+    chain            TEXT DEFAULT 'solana',
+    venue            TEXT DEFAULT 'spot',
+    pct_long         REAL DEFAULT 50,
+    long_count       INTEGER DEFAULT 0,
+    short_count      INTEGER DEFAULT 0,
+    neutral_count    INTEGER DEFAULT 0,
+    total_long_usd   REAL DEFAULT 0,
+    total_short_usd  REAL DEFAULT 0,
+    computed_at      INTEGER DEFAULT 0,
+    PRIMARY KEY (token_addr, venue)
+);
 """
 
 
