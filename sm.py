@@ -111,16 +111,28 @@ def cmd_whoami():
             client = FomoscanClient()
             try:
                 info = await client.whoami()
-                plan = info.get("plan", {}) or {}
+                # /v2/me: plan is a string, usage and entitlement are objects
+                plan = info.get("plan", "?")
                 usage = info.get("usage", {}) or {}
+                entitlement = info.get("entitlement", {}) or {}
+                key_info = info.get("key", {}) or {}
                 console.print(f"[bold]fomoscan[/]")
-                console.print(f"  plan: [cyan]{plan.get('name', '?')}[/]")
-                credits_left = usage.get("creditsRemaining") or usage.get("credits")
+                console.print(f"  key: [dim]{key_info.get('name', key_info.get('prefix', '?'))}[/]")
+                console.print(f"  plan: [cyan]{plan}[/]")
+                credits_left = usage.get("unitsRemaining")
+                credits_used = usage.get("unitsUsed", 0)
                 if credits_left is not None:
-                    console.print(f"  credits: [green]{credits_left:,}[/]")
-                reveals_left = usage.get("revealsRemaining") or usage.get("reveals")
+                    console.print(f"  credits: [green]{credits_left:,}[/] remaining  [dim]({credits_used:,} used)[/]")
+                reveals_left = usage.get("revealsRemaining")
+                reveals_used = usage.get("revealsUsed", 0)
                 if reveals_left is not None:
-                    console.print(f"  reveals: [green]{reveals_left:,}[/]")
+                    console.print(f"  reveals: [green]{reveals_left:,}[/] remaining  [dim]({reveals_used} used)[/]")
+                rate = entitlement.get("ratePerMinute")
+                if rate:
+                    console.print(f"  rate limit: [dim]{rate} req/min[/]")
+                extra = usage.get("additionalUnits", 0)
+                if extra:
+                    console.print(f"  credit packs: [dim]+{extra:,}[/]")
             except Exception as e:
                 console.print(f"[dim]fomoscan: {e}[/]")
             finally:

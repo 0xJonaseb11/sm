@@ -115,7 +115,7 @@ class FomoscanClient:
     # --- pump.fun via fomoscan ---
 
     async def pump_leaderboard(self) -> dict:
-        r = await self._http.get("/v2/pump/pnl-leaderboard")
+        r = await self._http.get("/v2/pump/leaderboard/traders")
         r.raise_for_status()
         return r.json()
 
@@ -181,7 +181,7 @@ class FomoscanClient:
     # --- account / key info ---
 
     async def whoami(self) -> dict:
-        r = await self._http.get("/v3/account")
+        r = await self._http.get("/v2/me")
         r.raise_for_status()
         return r.json()
 
