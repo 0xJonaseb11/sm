@@ -154,10 +154,17 @@ async def run_pump_board(window: str = "7d") -> None:
             await client_p.close()
         return
 
-    entries = data.get("items", []) or data.get("data", []) or []
+    entries = (
+        data.get("entries")
+        or data.get("items")
+        or data.get("data")
+        or []
+    )
+    period = data.get("period", "")
 
     t = Table(
-        title=f"pump.fun pnl leaderboard ({source})",
+        title=f"pump.fun pnl leaderboard ({source}"
+              + (f" - {period}" if period else "") + ")",
         box=box.SIMPLE_HEAD,
         header_style="bold white",
         expand=False,
@@ -167,25 +174,23 @@ async def run_pump_board(window: str = "7d") -> None:
     t.add_column("wallet", width=14)
     t.add_column("realized", width=12, justify="right")
     t.add_column("unrealized", width=12, justify="right")
-    t.add_column("total", width=12, justify="right")
+    t.add_column("total (usd)", width=12, justify="right")
 
-    for i, entry in enumerate(entries[:100], 1):
-        handle = (
-            entry.get("handle")
-            or entry.get("username")
-            or entry.get("name")
-            or entry.get("trader", {}).get("handle", "")
-        )
-        wallet = entry.get("wallet", "") or entry.get("address", "")
-        realized = entry.get("realizedPnl") or entry.get("realized") or 0
-        unrealized = entry.get("unrealizedPnl") or entry.get("unrealized") or 0
-        total = entry.get("totalPnl") or entry.get("total")
+    for entry in entries[:100]:
+        rank     = entry.get("rank", "?")
+        handle   = entry.get("username") or entry.get("handle") or entry.get("name") or "-"
+        wallet   = entry.get("wallet", "") or entry.get("address", "")
+        realized = entry.get("realizedPnlUsd") or entry.get("realizedPnl") or entry.get("realized") or 0
+        unrealized = entry.get("unrealizedPnlUsd") or entry.get("unrealizedPnl") or entry.get("unrealized") or 0
+        total    = entry.get("pnlUsd") or entry.get("totalPnl") or entry.get("total")
         if total is None:
             total = float(realized or 0) + float(unrealized or 0)
+        verified = entry.get("isVerified", False)
+        name_str = f"[bold]{handle}[/]" + ("[dim]*[/]" if verified else "")
 
         t.add_row(
-            str(i),
-            f"[bold]{handle or '-'}[/]",
+            str(rank),
+            name_str,
             fmt.short_addr(str(wallet), 5),
             f"[{fmt.pnl_color(realized)}]{fmt.usd(realized)}[/]",
             f"[{fmt.pnl_color(unrealized)}]{fmt.usd(unrealized)}[/]",
