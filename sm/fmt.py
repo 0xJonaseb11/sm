@@ -1,8 +1,12 @@
-"""formatting helpers shared across views."""
+"""formatting helpers shared across all views and scripts."""
 
 import datetime
 import time as _time
 
+
+# -------------------------------------------------------------------------
+# numbers
+# -------------------------------------------------------------------------
 
 def usd(amount: float | int | None, sign: bool = True) -> str:
     if amount is None:
@@ -16,25 +20,50 @@ def usd(amount: float | int | None, sign: bool = True) -> str:
     return f"{prefix}${val:.2f}"
 
 
+def pct(val: float | None) -> str:
+    if val is None:
+        return "-"
+    prefix = "+" if val > 0 else ""
+    return f"{prefix}{val:.1f}%"
+
+
 def pnl_color(val: float | None) -> str:
     if val is None:
         return "dim"
     return "green" if val >= 0 else "red"
 
 
+def num(val: float | int | None, decimals: int = 0) -> str:
+    if val is None:
+        return "-"
+    if decimals == 0:
+        return f"{int(val):,}"
+    return f"{float(val):,.{decimals}f}"
+
+
+# -------------------------------------------------------------------------
+# addresses
+# -------------------------------------------------------------------------
+
 def short_addr(addr: str, n: int = 6) -> str:
     if not addr:
         return ""
-    if len(addr) <= n * 2 + 2:
+    if len(addr) <= n * 2 + 3:
         return addr
     return f"{addr[:n]}...{addr[-n:]}"
 
 
-def ts_ago(ts: int) -> str:
+# -------------------------------------------------------------------------
+# time
+# -------------------------------------------------------------------------
+
+def ts_ago(ts: int | float) -> str:
     if not ts:
         return ""
-    now = int(datetime.datetime.now(datetime.timezone.utc).timestamp())
-    diff = now - ts
+    now  = int(_time.time())
+    diff = now - int(ts)
+    if diff < 0:
+        return "just now"
     if diff < 60:
         return f"{diff}s ago"
     if diff < 3600:
@@ -44,99 +73,116 @@ def ts_ago(ts: int) -> str:
     return f"{diff // 86400}d ago"
 
 
+def iso_to_ts(s: str) -> int:
+    if not s:
+        return 0
+    try:
+        dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return int(dt.timestamp())
+    except Exception:
+        return 0
+
+
+def iso_short(s: str) -> str:
+    """'2026-11-07T04:49:12Z' -> '11-07 04:49'"""
+    if not s:
+        return ""
+    try:
+        dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+        return dt.strftime("%m-%d %H:%M")
+    except Exception:
+        return s[:16]
+
+
+# -------------------------------------------------------------------------
+# rich tags
+# -------------------------------------------------------------------------
+
 def platform_tag(platform: str) -> str:
     tags = {
-        "fomo": "[bold cyan]fomo[/]",
-        "pump": "[bold magenta]pump[/]",
-        "x": "[bold blue]x[/]",
+        "fomo":        "[bold cyan]fomo[/]",
+        "pump":        "[bold magenta]pump[/]",
+        "x":           "[bold blue]x[/]",
+        "hyperliquid": "[bold yellow]hl[/]",
     }
-    return tags.get(platform.lower(), f"[dim]{platform}[/]")
+    return tags.get((platform or "").lower(), f"[dim]{platform}[/]")
 
 
 def side_tag(side: str | None) -> str:
     if not side:
         return ""
-    if side.lower() == "buy":
+    s = (side or "").lower()
+    if s == "buy":
         return "[bold green]buy[/]"
-    if side.lower() == "sell":
+    if s == "sell":
         return "[bold red]sell[/]"
     return f"[dim]{side}[/]"
 
 
 def tier_tag(tier: str) -> str:
     colors = {
-        "proven": "green",
-        "account": "cyan",
-        "partial": "yellow",
-        "weak": "dim",
-        "unverified": "dim red",
+        "proven":      "green",
+        "account":     "cyan",
+        "partial":     "yellow",
+        "weak":        "dim",
+        "unverified":  "dim red",
     }
-    color = colors.get(tier, "dim")
+    color = colors.get((tier or "").lower(), "dim")
     return f"[{color}]{tier}[/]"
 
 
+def verified_star(verified: bool) -> str:
+    return "[bold green]*[/]" if verified else " "
+
+
+# -------------------------------------------------------------------------
+# post/frame parsing
+# -------------------------------------------------------------------------
+
 def extract_post_parts(frame: dict) -> dict:
     """
-    pull the useful bits out of a fomoscan v3 post frame.
-    returns a flat dict ready for display.
+    normalize a fomoscan v3 websocket post frame to a flat display dict.
     """
-    item = frame.get("item", {})
-    trader = item.get("trader", {}) or {}
-    canonical = trader.get("canonical", {}) or {}
-    token = item.get("token", {}) or {}
+    item    = frame.get("item", {}) or {}
+    trader  = item.get("trader", {}) or {}
+    canon   = (trader.get("canonical") or {})
+    display = (canon.get("display") or {})
+    token   = item.get("token", {}) or {}
     platform = item.get("platform", "")
 
-    # get handle from canonical or first source
-    handle = canonical.get("handle", "")
-    display = canonical.get("displayName", "") or handle
+    handle  = display.get("handle", "") or ""
+    name    = display.get("name", "") or handle
 
-    # token info
-    tok_sym = ""
+    tok_sym  = token.get("symbol", "") or token.get("name", "")
     tok_addr = ""
-    if token:
-        tok_sym = token.get("symbol", "") or token.get("name", "")
-        market = (token.get("canonical") or {}).get("market") or {}
-        tok_addr = market.get("address", "") or token.get("address", "")
+    canon_market = (token.get("canonical") or {}).get("market") or {}
+    tok_addr = canon_market.get("address", "") or token.get("address", "")
 
-    # wallet
-    wallet = item.get("wallet", "") or ""
+    wallet  = item.get("wallet", "") or ""
+    body    = item.get("body", "") or item.get("text", "") or ""
 
-    # post body
-    body = item.get("body", "") or item.get("text", "") or ""
-
-    # side from position attached to post
     position = item.get("position") or {}
-    side = None
-    usd_value = None
+    side     = None
+    usd_val  = None
     if position:
-        side = position.get("side") or position.get("type")
-        usd_value = position.get("usdValue") or position.get("usd")
+        side    = position.get("side") or position.get("type")
+        usd_val = position.get("usdValue") or position.get("usd")
 
-    # normalize timestamp to unix int
-    raw_ts = item.get("postedAt", "") or item.get("createdAt", "") or ""
-    if raw_ts and isinstance(raw_ts, str):
-        try:
-            dt = datetime.datetime.fromisoformat(raw_ts.replace("Z", "+00:00"))
-            ts_int = int(dt.timestamp())
-        except Exception:
-            ts_int = int(_time.time())
-    elif isinstance(raw_ts, (int, float)):
-        ts_int = int(raw_ts)
-    else:
-        ts_int = int(_time.time())
+    raw_ts  = item.get("postedAt", "") or item.get("createdAt", "") or ""
+    ts_int  = iso_to_ts(raw_ts) if isinstance(raw_ts, str) else int(raw_ts or _time.time())
 
     return {
-        "id": item.get("id", ""),
-        "platform": platform,
+        "id":        item.get("id", ""),
+        "platform":  platform,
         "trader_id": trader.get("id", ""),
-        "handle": handle,
-        "display": display,
-        "wallet": wallet,
+        "handle":    handle,
+        "display":   name,
+        "wallet":    wallet,
         "token_sym": tok_sym,
-        "token_addr": tok_addr,
-        "side": side,
-        "usd_value": usd_value,
-        "body": body,
-        "ts": ts_int,
-        "raw": item,
+        "token_addr":tok_addr,
+        "side":      side,
+        "usd_value": usd_val,
+        "body":      body,
+        "ts":        ts_int,
+        "raw":       item,
     }

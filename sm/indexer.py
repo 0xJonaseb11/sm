@@ -1,6 +1,6 @@
 """
-background indexer - polls fomoscan rankings and stores wallets + traders
-in the local sqlite db so the tool works offline or as a cross-reference.
+background indexer - walks fomoscan rankings and stores traders + wallets
+to sqlite. uses v2 endpoints that work on all plans.
 """
 
 import asyncio
@@ -15,135 +15,175 @@ from sm import db as dbmod
 log = logging.getLogger("sm.indexer")
 
 
-async def _index_ranking(client: FomoscanClient, database, ranking_id: str) -> int:
-    """pull one ranking and upsert all traders and wallets. returns count indexed."""
+def _decode(a) -> float | None:
+    if a is None:
+        return None
+    if isinstance(a, (int, float)):
+        return float(a)
+    raw = a.get("value")
+    dec = a.get("decimals", 6)
+    return float(str(raw)) / (10 ** dec) if raw is not None else None
+
+
+async def _index_ranking(
+    client: FomoscanClient, database, ranking_key: str, label: str
+) -> int:
     try:
-        data = await client.get_ranking(ranking_id)
-        entries = data.get("items", []) or data.get("entries", [])
+        data    = await client.get_ranking(ranking_key)
+        entries = data.get("entries", []) or []
     except Exception as e:
-        log.warning("ranking %s failed: %s", ranking_id, e)
+        log.warning("ranking %s failed: %s", ranking_key, e)
         return 0
 
     count = 0
     for entry in entries:
-        trader = entry.get("trader", {}) or {}
-        tid = trader.get("id", "")
-        if not tid:
+        subject  = entry.get("subject", {}) or {}
+        canon    = subject.get("canonical", {}) or {}
+        display  = canon.get("display", {}) or {}
+        handle   = display.get("handle", "") or ""
+        name     = display.get("name", "") or handle
+        platforms = canon.get("platforms", [])
+
+        sources  = subject.get("sources", {}) or {}
+        src      = next(iter(sources.values()), {}) if sources else {}
+        follow   = src.get("followGraph", {}) or {}
+        followers = follow.get("followers") or 0
+
+        # for v3 ranking entries there's no stable id from list_rankings
+        # use the FOMO user id from sources if available
+        fomo_src = sources.get("fomo", {}) or {}
+        fs_uid   = fomo_src.get("profile", {}).get("id", "") if fomo_src else ""
+        # fall back: compose a stable key from handle
+        trader_id = fs_uid or f"idx:{handle}"
+
+        if not handle:
             continue
 
-        canonical = (trader.get("canonical") or {})
-        handle = canonical.get("handle", "")
-        display = canonical.get("displayName", "") or handle
-        platforms = canonical.get("platforms", [])
+        # look up v2 to get wallet + twitter
+        sol_addr = ""
+        evm_addr = ""
+        twitter  = ""
+        try:
+            u = await client.get_user_by_handle(handle)
+            sol_addr = u.get("solanaAddress", "") or ""
+            evm_addr = u.get("evmAddress", "") or ""
+            twitter  = u.get("twitter", "") or ""
+            trader_id = u.get("id", trader_id)
+        except Exception:
+            pass
 
-        # upsert trader
         await dbmod.upsert_trader(database, {
-            "id": tid,
-            "handle": handle,
-            "display": display,
-            "platform": platforms[0] if platforms else "",
-            "wallets": [],
+            "id":        trader_id,
+            "handle":    handle,
+            "display":   name,
+            "platform":  platforms[0] if platforms else "",
+            "wallets":   [w for w in [sol_addr, evm_addr] if w],
+            "sol_addr":  sol_addr,
+            "evm_addr":  evm_addr,
+            "twitter":   twitter,
+            "followers": followers,
         })
 
-        # try to get wallets
-        try:
-            w_resp = await client.get_trader_wallets(tid)
-            wallets = w_resp.get("items", [])
-            addrs = []
-            for w in wallets:
-                addr = w.get("address", "")
-                family = w.get("family", "")
-                owners = w.get("owners", []) or []
-                tier = owners[0].get("tier", "unverified") if owners else "unverified"
-                addrs.append(addr)
-                if addr:
-                    await dbmod.upsert_wallet(database, {
-                        "address": addr,
-                        "family": family,
-                        "trader_id": tid,
-                        "handle": handle,
-                        "display": display,
-                        "tier": tier,
-                    })
-            # update trader wallets list
-            await dbmod.upsert_trader(database, {
-                "id": tid,
-                "handle": handle,
-                "display": display,
-                "platform": platforms[0] if platforms else "",
-                "wallets": addrs,
+        if sol_addr:
+            await dbmod.upsert_wallet(database, {
+                "address":   sol_addr,
+                "family":    "solana",
+                "trader_id": trader_id,
+                "handle":    handle,
+                "display":   name,
+                "tier":      "account",
             })
-            count += 1
-        except Exception as e:
-            log.debug("wallets for %s: %s", tid, e)
+        if evm_addr:
+            await dbmod.upsert_wallet(database, {
+                "address":   evm_addr,
+                "family":    "evm",
+                "trader_id": trader_id,
+                "handle":    handle,
+                "display":   name,
+                "tier":      "account",
+            })
 
+        count += 1
         # be kind to rate limits
-        await asyncio.sleep(0.2)
+        await asyncio.sleep(0.3)
 
     return count
 
 
-async def run_index(interval_minutes: int = 30) -> None:
-    """run indexer loop, polling every interval_minutes."""
-    if not cfg.has_fomoscan():
-        print("error: FOMOSCAN_KEY not set, indexer cannot run")
-        return
+async def _index_pump(client: FomoscanClient, database) -> int:
+    try:
+        data    = await client.pump_leaderboard()
+        entries = data.get("entries", []) or []
+    except Exception as e:
+        log.warning("pump leaderboard failed: %s", e)
+        return 0
 
-    database = await dbmod.init()
-    client = FomoscanClient()
+    count = 0
+    for entry in entries:
+        handle  = entry.get("username") or entry.get("handle") or ""
+        wallet  = entry.get("wallet", "") or ""
+        if not wallet:
+            continue
 
-    print(f"indexer started, polling every {interval_minutes}m")
+        await dbmod.upsert_wallet(database, {
+            "address":   wallet,
+            "family":    "solana",
+            "trader_id": f"pump:{handle}",
+            "handle":    handle,
+            "display":   handle,
+            "tier":      "account" if entry.get("isVerified") else "partial",
+        })
+        count += 1
 
-    while True:
-        try:
-            rankings = await client.list_rankings()
-            items = rankings.get("items", [])
-            log.info("found %d rankings to index", len(items))
-
-            total = 0
-            for item in items:
-                rid = item.get("id", "")
-                if rid:
-                    n = await _index_ranking(client, database, rid)
-                    total += n
-                    log.info("indexed %d traders from ranking %s", n, rid)
-
-            log.info("index pass complete, %d traders total", total)
-        except Exception as e:
-            log.warning("index pass failed: %s", e)
-
-        await asyncio.sleep(interval_minutes * 60)
+    return count
 
 
-async def index_once() -> None:
-    """run a single index pass and exit."""
+async def index_once(verbose: bool = True) -> None:
     if not cfg.has_fomoscan():
         print("error: FOMOSCAN_KEY not set")
         return
 
     database = await dbmod.init()
-    client = FomoscanClient()
+    client   = FomoscanClient()
+
+    def _log(msg: str) -> None:
+        if verbose:
+            print(msg)
 
     try:
-        print("fetching available rankings...")
+        _log("fetching available rankings...")
         rankings = await client.list_rankings()
-        items = rankings.get("items", [])
-        print(f"found {len(items)} rankings")
+        items    = rankings.get("items", [])
+        _log(f"found {len(items)} rankings")
 
         total = 0
         for item in items:
-            rid = item.get("id", "")
+            key    = item.get("key", "")
             metric = item.get("metric", "")
             window = item.get("window", "")
-            if rid:
-                print(f"  indexing {metric} {window}...")
-                n = await _index_ranking(client, database, rid)
+            if key:
+                _log(f"  indexing {metric} {window}...")
+                n = await _index_ranking(client, database, key, f"{metric}/{window}")
                 total += n
-                print(f"    -> {n} traders indexed")
+                _log(f"    -> {n} traders indexed")
 
-        print(f"\ndone. {total} traders in db.")
+        _log("indexing pump.fun leaderboard...")
+        n = await _index_pump(client, database)
+        _log(f"  -> {n} pump wallets indexed")
+        total += n
+
+        st = await dbmod.stats(database)
+        _log(f"\ndone. db: {st['traders']} traders, {st['wallets']} wallets, {st['events']} events")
+
     except Exception as e:
         print(f"index error: {e}")
     finally:
         await client.close()
         await database.close()
+
+
+async def run_index(interval_minutes: int = 30) -> None:
+    print(f"indexer started, polling every {interval_minutes}m")
+    while True:
+        await index_once(verbose=False)
+        await asyncio.sleep(interval_minutes * 60)
