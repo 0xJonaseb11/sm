@@ -259,5 +259,57 @@ def cmd_whoami():
     _run(_go())
 
 
+# -------------------------------------------------------------------------
+# signals  (hyperliquid perp positions + smart money bias)
+# -------------------------------------------------------------------------
+
+@cli.command("signals")
+@click.option("--hl-top", default=0, type=int, help="index top N HL leaderboard traders")
+@click.option("--token",  default="",          help="show signal breakdown for a token")
+@click.option("--venue",  default="hyperliquid")
+@click.option("--wallet", default="",          help="show open HL positions for an EVM wallet")
+@click.option("--watch",  is_flag=True,        help="watch for position changes (polls every 60s)")
+@click.option("--interval", default=60, type=int)
+@click.option("--api",    is_flag=True,        help="start REST API server")
+@click.option("--port",   default=8787, type=int)
+def cmd_signals(hl_top, token, venue, wallet, watch, interval, api, port):
+    """
+    smart money position signals with real trader identities.
+
+      sm signals                        show stored signals
+      sm signals --hl-top 200          index top 200 HL traders (free, no key)
+      sm signals --token HYPE          who is long/short HYPE
+      sm signals --wallet 0x...        open positions for one wallet
+      sm signals --watch               poll for position changes
+      sm signals --api                 start REST API on port 8787
+    """
+    import subprocess, sys
+    args = ["python", "scripts/signals.py"]
+    if hl_top:
+        args += ["--hl-top", str(hl_top)]
+    if token:
+        args += ["--token", token, "--venue", venue]
+    if wallet:
+        args += ["--wallet", wallet]
+    if watch:
+        args += ["--watch", "--interval", str(interval)]
+    if api:
+        args += ["--api", "--port", str(port)]
+    subprocess.run(args)
+
+
+# -------------------------------------------------------------------------
+# api  (alias for signals --api)
+# -------------------------------------------------------------------------
+
+@cli.command("api")
+@click.option("--port", default=8787, type=int)
+def cmd_api(port):
+    """start REST API server for stupidmoney.io consumption."""
+    from sm.api.server import run
+    console.print(f"[bold]starting SM API on port {port}[/]")
+    run(port=port)
+
+
 if __name__ == "__main__":
     cli()
