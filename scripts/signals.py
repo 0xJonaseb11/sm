@@ -193,14 +193,16 @@ async def cmd_wallet(hl: HyperliquidClient, wallet: str) -> None:
     ))
 
 
-async def cmd_hl_top(hl: HyperliquidClient, db_conn, top: int) -> None:
+async def cmd_hl_top(hl: HyperliquidClient, db_conn, top: int, enrich: bool = False) -> None:
     """
     index top N hyperliquid traders:
       1. fetch leaderboard from stats-data endpoint
-      2. upsert EVM wallets to db
-      3. batch-fetch clearinghouse states
-      4. write positions to db
-      5. aggregate signals
+      2. insert wallets WITHOUT overwriting existing fomoscan/pump identity
+      3. cross-reference against already-indexed fomoscan traders by evm_addr
+      4. batch-fetch clearinghouse states
+      5. write positions to db
+      6. optionally run nansen FOMO label detection on unidentified wallets
+      7. aggregate signals
     """
     console.print(f"[dim]fetching hyperliquid leaderboard (top {top})...[/]")
 
@@ -219,19 +221,41 @@ async def cmd_hl_top(hl: HyperliquidClient, db_conn, top: int) -> None:
         addr   = parsed["eth_address"]
         if not addr:
             continue
-        addrs.append(addr)
-        await db.upsert_wallet(db_conn, {
-            "address":   addr.lower(),
-            "family":    "evm",
-            "trader_id": "",
-            "handle":    "",
-            "display":   parsed["display"] or f"hl:{fmt.short_addr(addr, 6)}",
-            "tier":      "unverified",
-            "ns_label":  "",
-            "ns_fomo":   "",
-        })
+        addrs.append(addr.lower())
+        # INSERT OR IGNORE: never overwrite an existing wallet that already has
+        # a fomoscan handle or pump identity from sm index
+        await db_conn.execute(
+            """
+            INSERT OR IGNORE INTO wallets
+                (address, family, trader_id, handle, display, tier, ns_label, ns_fomo, updated_at)
+            VALUES (?, 'evm', '', '', ?, 'unverified', '', '', ?)
+            """,
+            (addr.lower(), parsed["display"] or fmt.short_addr(addr, 6), int(time.time())),
+        )
+    await db_conn.commit()
 
-    console.print(f"[dim]indexed {len(addrs)} wallets. fetching positions...[/]")
+    # cross-reference: attach known fomoscan/pump handles to HL wallets that
+    # were already indexed via `sm index` (match on evm_addr in traders table)
+    await db_conn.execute(
+        """
+        UPDATE wallets
+        SET handle    = (SELECT t.handle  FROM traders t WHERE LOWER(t.evm_addr) = wallets.address LIMIT 1),
+            display   = (SELECT t.display FROM traders t WHERE LOWER(t.evm_addr) = wallets.address LIMIT 1),
+            trader_id = (SELECT t.id      FROM traders t WHERE LOWER(t.evm_addr) = wallets.address LIMIT 1)
+        WHERE family = 'evm'
+          AND handle = ''
+          AND EXISTS (SELECT 1 FROM traders t WHERE LOWER(t.evm_addr) = wallets.address)
+        """
+    )
+    await db_conn.commit()
+
+    # count how many got identified
+    async with db_conn.execute(
+        "SELECT COUNT(*) FROM wallets WHERE family='evm' AND handle != ''"
+    ) as cur:
+        identified = (await cur.fetchone())[0]
+
+    console.print(f"[dim]indexed {len(addrs)} wallets ({identified} with identity). fetching positions...[/]")
 
     states    = await hl.batch_clearinghouse_states(addrs, concurrency=10)
     now       = int(time.time())
@@ -264,15 +288,61 @@ async def cmd_hl_top(hl: HyperliquidClient, db_conn, top: int) -> None:
 
     await db_conn.commit()
 
+    # optional nansen FOMO label enrichment for unidentified wallets
+    if enrich:
+        await _enrich_unknown_wallets(db_conn, addrs)
+
     n_signals = await aggregate_signals(db_conn)
     console.print(
         f"[green]indexed {len(addrs)} wallets | "
+        f"{identified} identified | "
         f"{pos_count} positions | "
         f"{n_signals} signal tokens[/]"
     )
 
-    # show results
     await cmd_show(db_conn)
+
+
+async def _enrich_unknown_wallets(db_conn, addrs: list[str]) -> None:
+    """
+    run nansen FOMO label detection on wallets that still have no handle.
+    rate-limited via nansen_limiter - safe to call even on large batches.
+    """
+    from sm.clients.nansen import NansenClient, is_fomo_label, extract_fomo_handle
+    async with db_conn.execute(
+        "SELECT address FROM wallets WHERE family='evm' AND handle='' AND address IN ({})".format(
+            ",".join("?" * len(addrs))
+        ),
+        addrs,
+    ) as cur:
+        unknown = [r["address"] for r in await cur.fetchall()]
+
+    if not unknown:
+        return
+
+    console.print(f"[dim]running nansen label check on {len(unknown)} unidentified wallets...[/]")
+    ns  = NansenClient()
+    now = int(time.time())
+    hit = 0
+    try:
+        results = await ns.batch_premium_labels(unknown, chain="evm")
+        for addr, data in results.items():
+            labels = data.get("labels", [])
+            for lbl in labels:
+                label_str = lbl.get("label", "") or ""
+                kinds     = lbl.get("kind", []) or []
+                if "unique-identifier/fomo-trader" in kinds:
+                    handle = extract_fomo_handle(label_str)
+                    await db_conn.execute(
+                        "UPDATE wallets SET ns_fomo=?, ns_label=?, handle=?, display=?, updated_at=? WHERE address=?",
+                        (handle, label_str, handle, handle, now, addr),
+                    )
+                    hit += 1
+        await db_conn.commit()
+    finally:
+        await ns.close()
+
+    console.print(f"[dim]nansen: {hit} FOMO traders identified from {len(unknown)} unknowns[/]")
 
 
 async def cmd_watch(hl: HyperliquidClient, db_conn, interval: int) -> None:
@@ -342,6 +412,7 @@ async def cmd_watch(hl: HyperliquidClient, db_conn, interval: int) -> None:
 def _args() -> argparse.Namespace:
     p = argparse.ArgumentParser(prog="signals")
     p.add_argument("--hl-top",   type=int, default=0,       help="index top N HL leaderboard traders")
+    p.add_argument("--enrich",   action="store_true",        help="run nansen FOMO label check on unidentified wallets")
     p.add_argument("--token",    type=str, default="",       help="show signal for a token (symbol or addr)")
     p.add_argument("--venue",    type=str, default="hyperliquid")
     p.add_argument("--wallet",   type=str, default="",       help="show open HL positions for wallet")
@@ -369,7 +440,7 @@ async def main() -> None:
             await cmd_wallet(hl, args.wallet)
 
         elif args.hl_top > 0:
-            await cmd_hl_top(hl, db_conn, top=args.hl_top)
+            await cmd_hl_top(hl, db_conn, top=args.hl_top, enrich=args.enrich)
 
         elif args.token:
             await cmd_token(db_conn, args.token, venue=args.venue)

@@ -111,7 +111,32 @@ async def init(path: str = cfg.db_path) -> aiosqlite.Connection:
     db.row_factory = aiosqlite.Row
     await db.executescript(SCHEMA)
     await db.commit()
+    await _migrate(db)
     return db
+
+
+async def _migrate(db: aiosqlite.Connection) -> None:
+    """
+    add columns that were introduced after the initial schema.
+    sqlite ALTER TABLE ADD COLUMN is idempotent-safe via try/except.
+    """
+    migrations = [
+        ("wallets", "ns_label",  "TEXT DEFAULT ''"),
+        ("wallets", "ns_fomo",   "TEXT DEFAULT ''"),
+        ("traders", "sol_addr",  "TEXT DEFAULT ''"),
+        ("traders", "evm_addr",  "TEXT DEFAULT ''"),
+        ("traders", "twitter",   "TEXT DEFAULT ''"),
+        ("traders", "followers", "INTEGER DEFAULT 0"),
+        ("traders", "pnl_24h",   "REAL"),
+        ("traders", "pnl_7d",    "REAL"),
+        ("traders", "pnl_30d",   "REAL"),
+    ]
+    for table, col, definition in migrations:
+        try:
+            await db.execute(f"ALTER TABLE {table} ADD COLUMN {col} {definition}")
+            await db.commit()
+        except Exception:
+            pass  # column already exists
 
 
 # -------------------------------------------------------------------------

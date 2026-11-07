@@ -264,15 +264,16 @@ def cmd_whoami():
 # -------------------------------------------------------------------------
 
 @cli.command("signals")
-@click.option("--hl-top", default=0, type=int, help="index top N HL leaderboard traders")
-@click.option("--token",  default="",          help="show signal breakdown for a token")
-@click.option("--venue",  default="hyperliquid")
-@click.option("--wallet", default="",          help="show open HL positions for an EVM wallet")
-@click.option("--watch",  is_flag=True,        help="watch for position changes (polls every 60s)")
-@click.option("--interval", default=60, type=int)
-@click.option("--api",    is_flag=True,        help="start REST API server")
-@click.option("--port",   default=8787, type=int)
-def cmd_signals(hl_top, token, venue, wallet, watch, interval, api, port):
+@click.option("--hl-top",  default=0, type=int, help="index top N HL leaderboard traders")
+@click.option("--enrich",  is_flag=True,         help="nansen FOMO label check on unidentified wallets")
+@click.option("--token",   default="",            help="show signal breakdown for a token")
+@click.option("--venue",   default="hyperliquid")
+@click.option("--wallet",  default="",            help="show open HL positions for an EVM wallet")
+@click.option("--watch",   is_flag=True,          help="watch for position changes (polls every 60s)")
+@click.option("--interval",default=60, type=int)
+@click.option("--api",     is_flag=True,          help="start REST API server")
+@click.option("--port",    default=8787, type=int)
+def cmd_signals(hl_top, enrich, token, venue, wallet, watch, interval, api, port):
     """
     smart money position signals with real trader identities.
 
@@ -287,6 +288,8 @@ def cmd_signals(hl_top, token, venue, wallet, watch, interval, api, port):
     args = ["python", "scripts/signals.py"]
     if hl_top:
         args += ["--hl-top", str(hl_top)]
+    if enrich:
+        args += ["--enrich"]
     if token:
         args += ["--token", token, "--venue", venue]
     if wallet:
