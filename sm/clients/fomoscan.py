@@ -3,14 +3,14 @@
 import asyncio
 import json
 import logging
-from typing import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable
 
 import httpx
 import websockets
 from websockets.exceptions import ConnectionClosed
 
-from sm.config import cfg
 from sm.clients.rate_limiter import fomoscan_limiter
+from sm.config import cfg
 
 log = logging.getLogger("sm.fomoscan")
 
@@ -217,6 +217,35 @@ class FomoscanStream:
     def __init__(self):
         self._cursor: str | None = None
 
+    def _subscribe_msg(
+        self,
+        platforms: list[str] | None,
+        tokens: list[str] | None,
+    ) -> str:
+        sub: dict = {"type": "subscribe", "topic": "posts"}
+        if platforms:
+            sub["platforms"] = platforms
+        if tokens:
+            sub["tokens"] = tokens
+        if self._cursor:
+            sub["since"] = self._cursor
+        return json.dumps(sub)
+
+    async def _handle_frame(self, ws, frame: dict, on_reconnect, platforms, tokens):
+        ftype = frame.get("type")
+        if ftype == "ready":
+            await ws.send(self._subscribe_msg(platforms, tokens))
+            if on_reconnect:
+                on_reconnect()
+        elif ftype == "post":
+            self._cursor = frame.get("cursor")
+            return frame
+        elif ftype == "error":
+            log.warning("ws error frame: %s", frame.get("error"))
+        elif ftype == "ping":
+            await ws.send(json.dumps({"type": "pong"}))
+        return None
+
     async def listen(
         self,
         platforms: list[str] | None = None,
@@ -234,36 +263,16 @@ class FomoscanStream:
                 ) as ws:
                     backoff = 1
                     async for raw in ws:
-                        frame = json.loads(raw)
-                        ftype = frame.get("type")
-
-                        if ftype == "ready":
-                            sub: dict = {"type": "subscribe", "topic": "posts"}
-                            if platforms:
-                                sub["platforms"] = platforms
-                            if tokens:
-                                sub["tokens"] = tokens
-                            if self._cursor:
-                                sub["since"] = self._cursor
-                            await ws.send(json.dumps(sub))
-                            if on_reconnect:
-                                on_reconnect()
-
-                        elif ftype == "post":
-                            self._cursor = frame.get("cursor")
-                            yield frame
-
-                        elif ftype == "error":
-                            log.warning("ws error frame: %s", frame.get("error"))
-
-                        elif ftype == "ping":
-                            await ws.send(json.dumps({"type": "pong"}))
-
+                        result = await self._handle_frame(
+                            ws, json.loads(raw), on_reconnect, platforms, tokens
+                        )
+                        if result is not None:
+                            yield result
             except ConnectionClosed as e:
                 log.warning("ws closed (%s), reconnecting in %ds", e.code, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
-            except Exception as e:
+            except (OSError, TimeoutError) as e:
                 log.warning("ws error: %s, reconnecting in %ds", e, backoff)
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, 60)
